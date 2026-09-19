@@ -258,7 +258,7 @@ const APP_LOGO = document.getElementById('app-favicon').getAttribute('href');
 /* PENTING: samakan angka ini dengan field "version" di package.json setiap kali merilis
    pembaruan aplikasi desktop. Saat dibungkus dengan Electron (lihat main.js/preload.js),
    nilai ini otomatis disinkronkan dari package.json lewat window.desktopApp.getVersion(). */
-let APP_VERSION = '1.0.2';
+let APP_VERSION = '1.0.3';
 if(window.desktopApp && typeof window.desktopApp.getVersion === 'function'){
   window.desktopApp.getVersion().then(v=>{ if(v) APP_VERSION = v; });
 }
@@ -467,8 +467,53 @@ function defaultTempatTanggal(){
   return (kota? kota+', ' : '') + fmtDate(Date.now());
 }
 function semesterLabel(semester){
-  return semester==='2' ? 'II ( Dua )' : 'I ( Satu )';
+  return String(semester)==='2' ? 'II ( Dua )' : 'I ( Satu )';
 }
+/* Semester aktif sekolah, selalu dinormalkan menjadi string '1' atau '2'
+   (di database bisa tersimpan sebagai angka 2 atau kosong). */
+function semesterAktifSekolah(){
+  return String(state.sekolahData?.semesterAktif ?? '').trim()==='2' ? '2' : '1';
+}
+/* Semester yang sedang dilihat pengguna. Dipakai BERSAMA oleh Input Nilai, Rekap,
+   Rapor Wali Kelas, dan Rapor Siswa, sehingga nilai yang diinput pada Semester 2
+   langsung muncul di halaman rapor tanpa harus menunggu Admin Sekolah mengganti
+   "Semester Aktif" sekolah. Bawaan: semester aktif sekolah. */
+function getSemesterView(){
+  const aktif = semesterAktifSekolah();
+  // Pilihan manual hanya berlaku selama semester aktif sekolah belum diganti Admin Sekolah.
+  const masihBerlaku = (state.semesterView==='1' || state.semesterView==='2') && state.semesterViewFor===aktif;
+  return masihBerlaku ? state.semesterView : aktif;
+}
+function setSemesterView(v){
+  state.semesterView = v;
+  state.semesterViewFor = semesterAktifSekolah();
+}
+/* Data sekolah dimuat sekali saat login. Muat ulang ringan setiap halaman guru/wali kelas/siswa
+   dibuka, supaya perubahan Tahun Ajaran/Semester oleh Admin Sekolah langsung terasa tanpa login ulang. */
+async function refreshSekolahData(){
+  const sekId = state.user?.sekolahId;
+  if(!sekId) return;
+  try{
+    const snap = await db.ref('sekolah/'+sekId).once('value');
+    if(snap.val()) state.sekolahData = snap.val();
+  }catch(e){ console.error('Gagal memuat ulang data sekolah:', e); }
+}
+function semesterSelectHtml(id){
+  const cur = getSemesterView();
+  return `<div style="display:flex;align-items:center;gap:8px;">
+    <label for="${id}" style="font-size:12.5px;color:var(--text-soft);">Semester</label>
+    <select id="${id}" class="box-input" style="width:auto;min-width:130px;">
+      <option value="1" ${cur==='1'?'selected':''}>Semester 1</option>
+      <option value="2" ${cur==='2'?'selected':''}>Semester 2</option>
+    </select>
+  </div>`;
+}
+function bindSemesterSelect(id, onChange){
+  const sel = el(id);
+  if(!sel) return;
+  sel.addEventListener('change', ()=>{ setSemesterView(sel.value); onChange(); });
+}
+let semRenderToken = 0; // mencegah render ganda bila semester diganti saat data masih dimuat
 function uid(){ return db.ref().push().key; }
 // Urutkan entri mapel berdasarkan field "urutan" (angka).
 // Mapel tanpa "urutan" ditaruh di akhir, urut sesuai nama.
@@ -520,6 +565,7 @@ async function handleAuthUser(fbUser){
       } else {
         state.user = Object.assign({uid: fbUser.uid, email: fbUser.email}, profile);
         state.tab = null;
+        state.semesterView = null;
         const saved = getSavedActiveRole(fbUser.uid);
         state.user.activeRole = (saved && availableRoles.includes(saved)) ? saved : availableRoles[0];
         setActiveRole(fbUser.uid, state.user.activeRole);
@@ -584,6 +630,13 @@ async function doLogout(){
 }
 
 /* Create a user (auth + db) without switching current admin session, via secondary app instance */
+/* Menyusun field bantu "sekolahId_kelasId" (dipakai sebagai indeks query pada Rules)
+   supaya Guru Mapel / Wali Kelas bisa membaca daftar siswa satu kelas TANPA perlu
+   izin baca ke seluruh node "users" lintas sekolah. Wajib disertakan setiap kali
+   kelasId seorang pengguna ditulis atau dihapus. */
+function kelasIndexPatch(sekolahId, kelasId){
+  return { sekolahId_kelasId: (sekolahId && kelasId) ? (sekolahId + '_' + kelasId) : null };
+}
 async function createManagedUser({nama, email, password, roles, extra}){
   let newUid, recovered = false;
   try{
@@ -614,6 +667,7 @@ async function createManagedUser({nama, email, password, roles, extra}){
     }
   }
   const payload = Object.assign({ nama, email, roles, status:'aktif', createdAt: Date.now() }, extra||{});
+  Object.assign(payload, kelasIndexPatch(payload.sekolahId, payload.kelasId));
   await db.ref('users/'+newUid).set(payload);
   return newUid;
 }
@@ -1082,9 +1136,12 @@ function navItemsFor(role){
       {id:'rekap', label:'Rekap Nilai', icon:iconBook()},
       {id:'siswa', label:'Siswa Kelas', icon:iconStudent()},
       {id:'rapor', label:'Rapor & Catatan', icon:iconLock()},
+      {id:'riwayat', label:'Riwayat Rapor Siswa', icon:iconBook()},
+      {id:'notifikasi', label:'Notifikasi Koreksi', icon:iconUsers()},
     ];
     case 'siswa': return [
       {id:'rapor', label:'Rapor Saya', icon:iconLock()},
+      {id:'riwayat', label:'Riwayat Rapor', icon:iconBook()},
       {id:'profil', label:'Profil', icon:iconStudent()},
     ];
   }
@@ -1453,13 +1510,7 @@ function openSekolahForm(id, data){
         <input id="f-nama" class="box-input" placeholder="Nama sekolah" value="${escHtml(data.nama||'')}">
         <input id="f-npsn" class="box-input" placeholder="NPSN" value="${escHtml(data.npsn||'')}">
         <input id="f-alamat" class="box-input" placeholder="Alamat" value="${escHtml(data.alamat||'')}">
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-          <input id="f-ta" class="box-input" placeholder="Tahun Ajaran (mis. 2025/2026)" value="${escHtml(data.tahunAjaranAktif||'')}">
-          <select id="f-sem" class="box-input">
-            <option value="1" ${data.semesterAktif=='1'?'selected':''}>Semester 1 (Ganjil)</option>
-            <option value="2" ${data.semesterAktif=='2'?'selected':''}>Semester 2 (Genap)</option>
-          </select>
-        </div>
+        <p style="font-size:12px;color:var(--text-soft);margin:0;line-height:1.6;">Tahun ajaran dan semester aktif diatur oleh Admin Sekolah masing-masing melalui menu Data Sekolah.</p>
       </div>
       <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px;">
         <button class="btn btn-outline btn-sm" onclick="closeModal()">Batal</button>
@@ -1471,7 +1522,6 @@ function openSekolahForm(id, data){
     if(!nama){ toast('Nama sekolah wajib diisi.','err'); return; }
     const payload = {
       nama, npsn: el('f-npsn').value.trim(), alamat: el('f-alamat').value.trim(),
-      tahunAjaranAktif: el('f-ta').value.trim(), semesterAktif: el('f-sem').value,
     };
     const refId = id || uid();
     const ok = await simpanAman(()=> db.ref('sekolah/'+refId).update(payload), 'Data sekolah tersimpan.');
@@ -1567,7 +1617,7 @@ async function renderAdminSekolah(target, tab){
 
 async function renderASOverview(target, sid){
   const [kSnap, uSnap, mSnap, pSnap] = await Promise.all([
-    db.ref('kelas/'+sid).once('value'), db.ref('users').once('value'),
+    db.ref('kelas/'+sid).once('value'), db.ref('users').orderByChild('sekolahId').equalTo(sid).once('value'),
     db.ref('mapel/'+sid).once('value'), db.ref('pengampu/'+sid).once('value')
   ]);
   const kelas = kSnap.val() || {};
@@ -1604,7 +1654,7 @@ async function renderASOverview(target, sid){
     </div>
     <div class="card" style="margin-top:16px;padding:20px 22px;">
       <h3 style="font-size:15px;margin:0 0 4px;">Tahun Ajaran Aktif: ${escHtml(state.sekolahData?.tahunAjaranAktif||'belum diatur')} — Semester ${escHtml(state.sekolahData?.semesterAktif||'-')}</h3>
-      <p style="color:var(--text-soft);font-size:13.5px;margin:0;">Atur melalui menu Data Sekolah (hubungi Admin Utama untuk perubahan tahun ajaran) atau lanjutkan pengelolaan kelas, mata pelajaran, dan pengguna melalui menu di samping.</p>
+      <p style="color:var(--text-soft);font-size:13.5px;margin:0;">Atur melalui menu Data Sekolah (tahun ajaran dan semester aktif diatur di sana) atau lanjutkan pengelolaan kelas, mata pelajaran, dan pengguna melalui menu di samping.</p>
     </div>`;
 }
 
@@ -1624,11 +1674,18 @@ async function renderASDataSekolah(target, sid){
       <label style="font-size:12.5px;color:var(--text-soft);">Alamat
         <input id="f-alamat" class="box-input" style="margin-top:5px;" placeholder="Alamat sekolah" value="${escHtml(s.alamat||'')}">
       </label>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;padding-top:6px;border-top:1px solid var(--border);margin-top:4px;">
-        <div><span style="font-size:12.5px;color:var(--text-soft);">Tahun Ajaran Aktif</span><br><strong>${escHtml(s.tahunAjaranAktif||'-')}</strong></div>
-        <div><span style="font-size:12.5px;color:var(--text-soft);">Semester</span><br><strong>${escHtml(s.semesterAktif||'-')}</strong></div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;padding-top:12px;border-top:1px solid var(--border);margin-top:4px;">
+        <label style="font-size:12.5px;color:var(--text-soft);">Tahun Ajaran Aktif
+          <input id="f-ta" class="box-input" style="margin-top:5px;" placeholder="mis. 2025/2026" value="${escHtml(s.tahunAjaranAktif||'')}">
+        </label>
+        <label style="font-size:12.5px;color:var(--text-soft);">Semester Aktif
+          <select id="f-sem" class="box-input" style="margin-top:5px;">
+            <option value="1" ${String(s.semesterAktif??'').trim()!=='2'?'selected':''}>Semester 1 (Ganjil)</option>
+            <option value="2" ${String(s.semesterAktif??'').trim()==='2'?'selected':''}>Semester 2 (Genap)</option>
+          </select>
+        </label>
       </div>
-      <p style="font-size:12px;color:var(--text-soft);margin:0;">Perubahan Tahun Ajaran/Semester hanya dapat dilakukan oleh Admin Utama.</p>
+      <p style="font-size:12px;color:var(--text-soft);margin:0;line-height:1.6;">Tahun ajaran dan semester aktif menjadi tampilan bawaan seluruh guru, wali kelas, dan siswa di sekolah ini, serta dicetak pada rapor.</p>
     </div>
     <div style="display:flex;justify-content:flex-end;margin-top:18px;">
       <button class="btn btn-primary btn-sm" id="save-datasekolah">Simpan Perubahan</button>
@@ -1637,10 +1694,31 @@ async function renderASDataSekolah(target, sid){
   el('save-datasekolah').addEventListener('click', async ()=>{
     const nama = el('f-nama').value.trim();
     if(!nama){ toast('Nama sekolah wajib diisi.','err'); return; }
-    const payload = { nama, npsn: el('f-npsn').value.trim(), alamat: el('f-alamat').value.trim() };
+    // Tahun ajaran: kosong boleh, tetapi bila diisi harus berformat 2025/2026 (tahun berurutan).
+    let ta = el('f-ta').value.trim();
+    if(ta){
+      const m = ta.match(/^(\d{4})\s*\/\s*(\d{4})$/);
+      if(!m || Number(m[2]) !== Number(m[1]) + 1){
+        toast('Format Tahun Ajaran harus seperti 2025/2026 (dua tahun berurutan).','err');
+        return;
+      }
+      ta = m[1] + '/' + m[2];
+    }
+    const sem = el('f-sem').value === '2' ? '2' : '1';
+    const taLama = s.tahunAjaranAktif || '';
+    const semLama = s.semesterAktif==null ? '' : String(s.semesterAktif).trim();
+    const sudahPernahDiatur = !!(taLama || semLama);
+    if(sudahPernahDiatur && (ta !== taLama || sem !== semLama)){
+      const yakin = confirm('Tahun Ajaran/Semester aktif akan diubah menjadi ' + (ta||'-') + ' — Semester ' + sem +
+        '.\n\nSeluruh guru, wali kelas, dan siswa akan melihat semester ini sebagai tampilan bawaan, dan nilainya tercetak pada rapor.\n\nLanjutkan?');
+      if(!yakin) return;
+    }
+    const payload = { nama, npsn: el('f-npsn').value.trim(), alamat: el('f-alamat').value.trim(),
+      tahunAjaranAktif: ta, semesterAktif: sem };
     const ok = await simpanAman(()=> db.ref('sekolah/'+sid).update(payload), 'Data sekolah tersimpan.');
     if(!ok) return;
     state.sekolahData = Object.assign({}, state.sekolahData, payload);
+    state.semesterView = null;
     renderASDataSekolah(el('main-content'), sid);
   });
 }
@@ -1678,7 +1756,7 @@ async function renderASKepsek(target, sid){
 }
 
 async function renderASKelas(target, sid){
-  const [kSnap, uSnap] = await Promise.all([db.ref('kelas/'+sid).once('value'), db.ref('users').once('value')]);
+  const [kSnap, uSnap] = await Promise.all([db.ref('kelas/'+sid).once('value'), db.ref('users').orderByChild('sekolahId').equalTo(sid).once('value')]);
   const kelas = kSnap.val() || {};
   const users = uSnap.val() || {};
   const waliList = Object.entries(users).filter(([id,u])=>u.sekolahId===sid && u.roles && u.roles.wali_kelas);
@@ -1754,9 +1832,9 @@ async function renderASKelas(target, sid){
         // Lepas kelas dari wali lama bila diganti, supaya ia tidak lagi bisa membuka
         // rekap nilai / mengunci rapor kelas yang bukan tanggung jawabnya.
         if(waliLama && waliLama !== payload.waliKelasUid){
-          await db.ref('users/'+waliLama+'/kelasId').remove();
+          await db.ref('users/'+waliLama).update(Object.assign({kelasId: null}, kelasIndexPatch(null, null)));
         }
-        if(payload.waliKelasUid) await db.ref('users/'+payload.waliKelasUid).update({kelasId: refId});
+        if(payload.waliKelasUid) await db.ref('users/'+payload.waliKelasUid).update(Object.assign({kelasId: refId}, kelasIndexPatch(sid, refId)));
       }, 'Kelas tersimpan.');
       if(!ok) return;
       closeModal(); renderASKelas(el('main-content'), sid);
@@ -1773,7 +1851,7 @@ async function renderASKelas(target, sid){
       // agar dashboard mereka tidak menunjuk "kelas hantu".
       const terkait = Object.entries(users).filter(([uidUser,u])=> u.sekolahId===sid && sameId(u.kelasId, kid));
       for(const [uidUser] of terkait){
-        await db.ref('users/'+uidUser+'/kelasId').remove();
+        await db.ref('users/'+uidUser).update(Object.assign({kelasId: null}, kelasIndexPatch(null, null)));
       }
     }, 'Kelas dihapus.');
     if(ok) renderASKelas(target, sid);
@@ -1852,7 +1930,7 @@ function guruRoleBadge(u){
 }
 
 async function renderASGuru(target, sid){
-  const uSnap = await db.ref('users').once('value');
+  const uSnap = await db.ref('users').orderByChild('sekolahId').equalTo(sid).once('value');
   const users = uSnap.val() || {};
   const list = Object.entries(users).filter(([id,u])=>u.sekolahId===sid && u.roles && (u.roles.guru||u.roles.wali_kelas));
   target.innerHTML = pageHeader('Guru & Wali Kelas', 'Akun pengajar di sekolah ini — satu akun (satu email) dapat merangkap sebagai Guru Mapel sekaligus Wali Kelas.',
@@ -1930,7 +2008,7 @@ async function renderASGuru(target, sid){
 }
 
 async function renderASSiswa(target, sid){
-  const [uSnap, kSnap] = await Promise.all([db.ref('users').once('value'), db.ref('kelas/'+sid).once('value')]);
+  const [uSnap, kSnap] = await Promise.all([db.ref('users').orderByChild('sekolahId').equalTo(sid).once('value'), db.ref('kelas/'+sid).once('value')]);
   const users = uSnap.val() || {};
   const kelas = kSnap.val() || {};
   const list = Object.entries(users).filter(([id,u])=>u.sekolahId===sid && u.roles && u.roles.siswa);
@@ -1982,7 +2060,27 @@ async function renderASSiswa(target, sid){
       const namaPanggilan = el('f-panggilan').value.trim(), kelasId = el('f-kelas').value;
       if(!nama){ toast('Nama wajib diisi.','err'); return; }
       if(isEdit){
-        const ok = await simpanAman(()=> db.ref('users/'+id).update({ nis, nama, namaPanggilan, kelasId }), 'Data siswa diperbarui.');
+        const kelasLama = data.kelasId || null;
+        const ok = await simpanAman(async ()=>{
+          // Jika kelas berubah (mis. kenaikan kelas di tahun ajaran baru), simpan dulu
+          // jejak kelas lama ke riwayatKelas siswa, agar Rapor Saya / Riwayat Rapor Siswa
+          // tetap bisa menampilkan & mencetak rapor dari kelas-kelas sebelumnya (kelas 1 s.d. 12).
+          if(kelasLama && kelasLama !== kelasId){
+            const kInfo = kelas[kelasLama] || {};
+            let taLama = '';
+            try{ taLama = (await db.ref('sekolah/'+sid+'/tahunAjaranAktif').once('value')).val() || ''; }catch(e){ console.error(e); }
+            await db.ref('users/'+id+'/riwayatKelas').push({
+              kelasId: kelasLama,
+              kelasNama: kInfo.nama || '',
+              tingkat: kInfo.tingkat || '',
+              tahunAjaran: taLama,
+              waliKelasUid: kInfo.waliKelasUid || null,
+              waliKelasNama: kInfo.waliKelasNama || null,
+              selesai: Date.now(),
+            });
+          }
+          await db.ref('users/'+id).update(Object.assign({ nis, nama, namaPanggilan, kelasId }, kelasIndexPatch(sid, kelasId)));
+        }, 'Data siswa diperbarui.');
         if(!ok) return;
         closeModal(); renderASSiswa(el('main-content'), sid);
         return;
@@ -2015,7 +2113,7 @@ async function renderASSiswa(target, sid){
 async function renderASPengampu(target, sid){
   const [kSnap, mSnap, uSnap, pSnap] = await Promise.all([
     db.ref('kelas/'+sid).once('value'), db.ref('mapel/'+sid).once('value'),
-    db.ref('users').once('value'), db.ref('pengampu/'+sid).once('value')
+    db.ref('users').orderByChild('sekolahId').equalTo(sid).once('value'), db.ref('pengampu/'+sid).once('value')
   ]);
   const kelas = kSnap.val()||{}, mapel = mSnap.val()||{}, users = uSnap.val()||{}, pengampu = pSnap.val()||{};
   const guruList = Object.entries(users).filter(([id,u])=>u.sekolahId===sid && u.roles && (u.roles.guru||u.roles.wali_kelas));
@@ -2049,11 +2147,11 @@ async function renderASPengampu(target, sid){
 }
 
 /* ===================== HELPER: AMBIL SISWA PER KELAS ===================== */
-/* Dipakai oleh Guru Mapel, Wali Kelas, dan Admin Sekolah.
-   Membaca seluruh node "users" sering ditolak aturan keamanan Firebase untuk akun
-   selain admin — itulah penyebab daftar siswa tampil kosong saat login sebagai guru.
-   Karena itu di sini dicoba dulu kueri terfilter (orderByChild('kelasId')), baru
-   jatuh ke pembacaan penuh bila kueri tidak tersedia. */
+/* Dipakai oleh Guru Mapel dan Wali Kelas. Query dibatasi pada field gabungan
+   "sekolahId_kelasId" (bukan "kelasId" saja) supaya Firebase Rules bisa memastikan
+   guru/wali hanya membaca data sekolahnya sendiri — bukan seluruh node "users"
+   lintas sekolah. Tidak ada lagi fallback ke pembacaan penuh /users: kalau query
+   ini ditolak, itu memang seharusnya ditolak (akun tsb bukan bagian sekolah ini). */
 function sortSiswaList(list){
   return list.sort((a,b)=> String(a[1].nama||'').localeCompare(String(b[1].nama||''), 'id'));
 }
@@ -2063,29 +2161,19 @@ async function fetchSiswaByKelas(sid, kelasId){
   const cocok = (u)=> u && u.roles && u.roles.siswa
     && sameId(u.sekolahId, sid) && sameId(u.kelasId, kelasId)
     && u.status !== 'nonaktif';
-  let lastErr = null;
-  try{
-    const snap = await db.ref('users').orderByChild('kelasId').equalTo(kelasId).once('value');
-    const hasil = Object.entries(snap.val()||{}).filter(([id,u])=>cocok(u));
-    if(hasil.length) return sortSiswaList(hasil);
-  }catch(e){ lastErr = e; console.warn('Kueri siswa per kelas gagal, mencoba pembacaan penuh:', e); }
-  try{
-    const snap = await db.ref('users').once('value');
-    return sortSiswaList(Object.entries(snap.val()||{}).filter(([id,u])=>cocok(u)));
-  }catch(e){
-    throw lastErr || e;
-  }
+  const snap = await db.ref('users').orderByChild('sekolahId_kelasId').equalTo(sid+'_'+kelasId).once('value');
+  return sortSiswaList(Object.entries(snap.val()||{}).filter(([id,u])=>cocok(u)));
 }
 function describeDbError(e){
   const msg = String((e && (e.message || e.code)) || e || '');
   if(/permission[_ ]denied/i.test(msg)){
     return 'Akses ditolak oleh aturan keamanan Firebase (permission denied) ketika membaca data pengguna. '
-      + 'Akun guru belum diizinkan membaca node "users", sehingga daftar siswa tidak dapat ditampilkan. '
-      + 'Perbarui Realtime Database Rules agar pengguna yang sudah masuk boleh membaca "users" '
-      + 'dan tambahkan ".indexOn": ["kelasId", "sekolahId"] pada node tersebut.';
+      + 'Perbarui Realtime Database Rules pada node "users" agar Admin Sekolah boleh membaca dengan '
+      + 'query orderByChild("sekolahId"), dan Guru/Wali Kelas boleh membaca dengan query '
+      + 'orderByChild("sekolahId_kelasId") — masing-masing dibatasi pada sekolahId akun yang login.';
   }
   if(/index not defined|indexOn/i.test(msg)){
-    return 'Firebase meminta indeks pada node "users". Tambahkan ".indexOn": ["kelasId", "sekolahId"] '
+    return 'Firebase meminta indeks pada node "users". Tambahkan ".indexOn": ["sekolahId", "sekolahId_kelasId", "email"] '
       + 'di dalam aturan node "users" pada Realtime Database Rules.';
   }
   return 'Gagal memuat data: ' + msg;
@@ -2104,6 +2192,7 @@ function loadingCard(msg){
 async function renderGuru(target, tab){
   const sid = state.user.sekolahId;
   target.innerHTML = loadingCard('Memuat penugasan mengajar…');
+  await refreshSekolahData();
   let pengampu = {}, kelas = {}, mapel = {};
   try{
     const [pSnap, kSnap, mSnap] = await Promise.all([
@@ -2140,8 +2229,8 @@ async function renderGuru(target, tab){
       <div style="min-width:140px;">
         <label style="font-size:12px;color:var(--text-soft);">Semester</label>
         <select id="sel-sem" class="box-input">
-          <option value="1" ${state.sekolahData?.semesterAktif==='1'?'selected':''}>Semester 1</option>
-          <option value="2" ${state.sekolahData?.semesterAktif==='2'?'selected':''}>Semester 2</option>
+          <option value="1" ${getSemesterView()==='1'?'selected':''}>Semester 1</option>
+          <option value="2" ${getSemesterView()==='2'?'selected':''}>Semester 2</option>
         </select>
       </div>
     </div>`;
@@ -2304,7 +2393,7 @@ async function renderGuru(target, tab){
     });
   }
   el('sel-assign').addEventListener('change', loadNilaiTable);
-  el('sel-sem').addEventListener('change', loadNilaiTable);
+  el('sel-sem').addEventListener('change', ()=>{ setSemesterView(el('sel-sem').value); loadNilaiTable(); });
   loadNilaiTable();
 }
 /* Rentang nilai akhir → kualifikasi deskriptif otomatis untuk Capaian Pembelajaran.
@@ -2337,12 +2426,103 @@ function predikatBadge(p){
   return `<span class="badge" style="background:${c[0]};color:${c[1]};">${p}</span>`;
 }
 
+/* ===================== MODAL CATATAN RAPOR (reusable) ===================== */
+/* Dipakai baik dari daftar siswa kelas (alur normal) maupun dari alur "Perbaiki Rapor"
+   lintas kelas (mis. wali kelas 4 SD memperbaiki rapor siswa yang sekarang sudah kelas 2 SMP).
+   Karena itu fungsi ini tidak bergantung pada siswaList kelas yang sedang aktif — cukup
+   sid + kelasId + semester + studentUid + data rapor yang bersangkutan. */
+function openCatatanRaporModal({sid, kelasId, semester, studentUid, studentNama, initialData, onSaved}){
+  const r = initialData || {};
+  openModal(`
+    <div style="padding:26px;">
+      <h3 style="margin:0 0 16px;font-size:17px;">Catatan Rapor — ${escHtml(studentNama||'')}</h3>
+      <div style="display:flex;flex-direction:column;gap:12px;">
+        <textarea id="f-catatan" class="box-input" rows="3" placeholder="Catatan wali kelas">${escHtml(r.catatanWaliKelas||'')}</textarea>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
+          <input id="f-spiritual" class="box-input" placeholder="Sikap Spiritual" value="${escHtml(r.sikap?.spiritual||'')}">
+          <input id="f-sosial" class="box-input" placeholder="Sikap Sosial" value="${escHtml(r.sikap?.sosial||'')}">
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
+          <input id="f-sakit" type="number" class="box-input" placeholder="Sakit (hari)" value="${r.kehadiran?.sakit??''}">
+          <input id="f-izin" type="number" class="box-input" placeholder="Izin (hari)" value="${r.kehadiran?.izin??''}">
+          <input id="f-alpa" type="number" class="box-input" placeholder="Tanpa Ket. (hari)" value="${r.kehadiran?.alpa??''}">
+        </div>
+        <div>
+          <label style="font-size:12.5px;color:var(--text-soft);">Ekstrakurikuler</label>
+          <div id="ekskul-rows" style="display:flex;flex-direction:column;gap:8px;margin-top:6px;"></div>
+          <button type="button" id="add-ekskul" class="btn btn-outline btn-sm" style="margin-top:8px;">${iconPlus()} Tambah Ekstrakurikuler</button>
+        </div>
+        ${semester==='2'? `<input id="f-keputusan" class="box-input" placeholder="Keputusan (mis. Naik ke Kelas V / Tinggal di Kelas IV)" value="${escHtml(r.keputusan||'')}">` : ''}
+        <input id="f-tempattgl" class="box-input" placeholder="Tempat, tanggal rapor dicetak" value="${escHtml(r.tempatTanggal||defaultTempatTanggal())}">
+      </div>
+      <div style="display:flex;gap:8px;justify-content:space-between;margin-top:18px;">
+        <button class="btn btn-outline btn-sm" id="finalize-btn">${iconLock()} ${r.finalized?'Buka Kunci':'Kunci Rapor'}</button>
+        <div style="display:flex;gap:8px;">
+          <button class="btn btn-outline btn-sm" onclick="closeModal()">Batal</button>
+          <button class="btn btn-primary btn-sm" id="save-rapor">Simpan</button>
+        </div>
+      </div>
+    </div>`);
+  function ekskulRowHtml(item){
+    item = item||{};
+    return `<div class="ekskul-row" style="display:flex;gap:8px;align-items:center;">
+      <input class="box-input ek-nama" placeholder="Nama kegiatan (mis. Pramuka)" value="${escHtml(item.nama||'')}" style="flex:2;">
+      <input class="box-input ek-nilai" placeholder="Nilai/Predikat (mis. Baik)" value="${escHtml(item.nilai||'')}" style="flex:1;">
+      <button type="button" class="btn btn-danger btn-sm del-ekskul-row">${iconTrash()}</button>
+    </div>`;
+  }
+  const ekskulWrap = el('ekskul-rows');
+  const existingEkskul = Array.isArray(r.ekstrakurikuler) && r.ekstrakurikuler.length? r.ekstrakurikuler : [{}];
+  ekskulWrap.innerHTML = existingEkskul.map(ekskulRowHtml).join('');
+  ekskulWrap.addEventListener('click', (ev)=>{
+    const btn = ev.target.closest('.del-ekskul-row');
+    if(!btn) return;
+    const rows = ekskulWrap.querySelectorAll('.ekskul-row');
+    if(rows.length>1) btn.closest('.ekskul-row').remove();
+    else btn.closest('.ekskul-row').querySelectorAll('input').forEach(i=>i.value='');
+  });
+  el('add-ekskul').addEventListener('click', ()=>{
+    ekskulWrap.insertAdjacentHTML('beforeend', ekskulRowHtml());
+  });
+  function getEkskulData(){
+    return Array.from(ekskulWrap.querySelectorAll('.ekskul-row')).map(row=>({
+      nama: row.querySelector('.ek-nama').value.trim(),
+      nilai: row.querySelector('.ek-nilai').value.trim()
+    })).filter(x=>x.nama);
+  }
+  const savePayload = ()=>({
+    catatanWaliKelas: el('f-catatan').value.trim(),
+    sikap: { spiritual: el('f-spiritual').value.trim(), sosial: el('f-sosial').value.trim() },
+    kehadiran: { sakit:+el('f-sakit').value||0, izin:+el('f-izin').value||0, alpa:+el('f-alpa').value||0 },
+    ekstrakurikuler: getEkskulData(),
+    keputusan: semester==='2'? (el('f-keputusan')?.value.trim()||'') : (r.keputusan||''),
+    tempatTanggal: el('f-tempattgl').value.trim(),
+  });
+  el('save-rapor').addEventListener('click', async ()=>{
+    const ok = await simpanAman(()=> db.ref(`rapor/${sid}/${kelasId}/${semester}/${studentUid}`).update(savePayload()), 'Catatan rapor tersimpan.');
+    if(!ok) return;
+    closeModal(); if(onSaved) onSaved();
+  });
+  el('finalize-btn').addEventListener('click', async ()=>{
+    const ok = await simpanAman(
+      ()=> db.ref(`rapor/${sid}/${kelasId}/${semester}/${studentUid}`).update(Object.assign(savePayload(), {finalized: !r.finalized})),
+      r.finalized? 'Rapor dibuka kembali.' : 'Rapor dikunci.');
+    if(!ok) return;
+    closeModal(); if(onSaved) onSaved();
+  });
+}
+
 /* ===================== WALI KELAS ===================== */
 async function renderWaliKelas(target, tab){
   const sid = state.user.sekolahId;
+  if(tab==='notifikasi'){
+    await renderNotifikasiWaliKelas(target);
+    return;
+  }
   const kelasId = state.user.kelasId;
   if(!kelasId){ target.innerHTML = `<div class="card" style="padding:22px;">Anda belum ditugaskan sebagai wali kelas manapun. Hubungi Admin Sekolah.</div>`; return; }
   target.innerHTML = loadingCard('Memuat data kelas…');
+  await refreshSekolahData();
   let kelasInfo = {}, mapel = {}, siswaList = [];
   try{
     const [kSnap, mSnap, sList] = await Promise.all([
@@ -2379,13 +2559,22 @@ async function renderWaliKelas(target, tab){
   }
 
   if(tab==='rekap'){
-    const semester = state.sekolahData?.semesterAktif || '1';
-    target.innerHTML = pageHeader('Rekap Nilai Kelas '+kelasInfo.nama, 'Semester '+semester+' — seluruh mata pelajaran.');
+    const semester = getSemesterView();
+    const myToken = ++semRenderToken;
+    target.innerHTML = pageHeader('Rekap Nilai Kelas '+kelasInfo.nama, 'Semester '+semester+' — seluruh mata pelajaran.', semesterSelectHtml('sel-sem-view'));
+    bindSemesterSelect('sel-sem-view', ()=> renderWaliKelas(target, 'rekap'));
     const nilaiAll = {};
-    for(const mid of Object.keys(mapel)){
-      const s = await db.ref(`nilai/${sid}/${kelasId}/${mid}/${semester}`).once('value');
-      nilaiAll[mid] = s.val()||{};
+    try{
+      const mids = Object.keys(mapel);
+      const snaps = await Promise.all(mids.map(mid=> db.ref(`nilai/${sid}/${kelasId}/${mid}/${semester}`).once('value')));
+      mids.forEach((mid,i)=>{ nilaiAll[mid] = snaps[i].val()||{}; });
+    }catch(e){
+      console.error(e);
+      if(myToken!==semRenderToken) return;
+      target.insertAdjacentHTML('beforeend', errorCard(describeDbError(e)));
+      return;
     }
+    if(myToken!==semRenderToken) return;
     const chartItems = sortedMapel(mapel).map(([mid,m])=>{
       const nilaiMapel = siswaList.map(([id])=>nilaiAll[mid][id]?.nilaiAkhir).filter(n=>typeof n==='number');
       const rata = nilaiMapel.length? Math.round(nilaiMapel.reduce((a,b)=>a+b,0)/nilaiMapel.length) : 0;
@@ -2407,17 +2596,21 @@ async function renderWaliKelas(target, tab){
   }
 
   if(tab==='rapor'){
-    const semester = state.sekolahData?.semesterAktif || '1';
-    target.innerHTML = pageHeader('Rapor & Catatan Wali Kelas', 'Semester '+semester+' — lengkapi catatan dan kunci rapor.');
+    const semester = getSemesterView();
+    const myToken = ++semRenderToken;
+    target.innerHTML = pageHeader('Rapor & Catatan Wali Kelas', 'Semester '+semester+' — lengkapi catatan dan kunci rapor.', semesterSelectHtml('sel-sem-view'));
+    bindSemesterSelect('sel-sem-view', ()=> renderWaliKelas(target, 'rapor'));
     let raporData = {};
     try{
       const rSnap = await db.ref(`rapor/${sid}/${kelasId}/${semester}`).once('value');
       raporData = rSnap.val()||{};
     }catch(e){
       console.error(e);
-      target.innerHTML += errorCard(describeDbError(e));
+      if(myToken!==semRenderToken) return;
+      target.insertAdjacentHTML('beforeend', errorCard(describeDbError(e)));
       return;
     }
+    if(myToken!==semRenderToken) return;
     const terkunci = siswaList.filter(([id])=>raporData[id]?.finalized).length;
     if(siswaList.length){
       const progWrap = document.createElement('div'); progWrap.className='card'; progWrap.style.padding='16px 20px'; progWrap.style.marginBottom='16px';
@@ -2442,92 +2635,49 @@ async function renderWaliKelas(target, tab){
 
     wrap.querySelectorAll('.edit-rapor').forEach(b=>b.addEventListener('click', ()=>{
       const sidStudent = b.dataset.id;
-      const r = raporData[sidStudent]||{};
-      openModal(`
-        <div style="padding:26px;">
-          <h3 style="margin:0 0 16px;font-size:17px;">Catatan Rapor — ${escHtml(siswaMap[sidStudent]?.nama||'')}</h3>
-          <div style="display:flex;flex-direction:column;gap:12px;">
-            <textarea id="f-catatan" class="box-input" rows="3" placeholder="Catatan wali kelas">${escHtml(r.catatanWaliKelas||'')}</textarea>
-            <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;">
-              <input id="f-spiritual" class="box-input" placeholder="Sikap Spiritual" value="${escHtml(r.sikap?.spiritual||'')}">
-              <input id="f-sosial" class="box-input" placeholder="Sikap Sosial" value="${escHtml(r.sikap?.sosial||'')}">
-            </div>
-            <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:10px;">
-              <input id="f-sakit" type="number" class="box-input" placeholder="Sakit (hari)" value="${r.kehadiran?.sakit??''}">
-              <input id="f-izin" type="number" class="box-input" placeholder="Izin (hari)" value="${r.kehadiran?.izin??''}">
-              <input id="f-alpa" type="number" class="box-input" placeholder="Tanpa Ket. (hari)" value="${r.kehadiran?.alpa??''}">
-            </div>
-            <div>
-              <label style="font-size:12.5px;color:var(--text-soft);">Ekstrakurikuler</label>
-              <div id="ekskul-rows" style="display:flex;flex-direction:column;gap:8px;margin-top:6px;"></div>
-              <button type="button" id="add-ekskul" class="btn btn-outline btn-sm" style="margin-top:8px;">${iconPlus()} Tambah Ekstrakurikuler</button>
-            </div>
-            ${semester==='2'? `<input id="f-keputusan" class="box-input" placeholder="Keputusan (mis. Naik ke Kelas V / Tinggal di Kelas IV)" value="${escHtml(r.keputusan||'')}">` : ''}
-            <input id="f-tempattgl" class="box-input" placeholder="Tempat, tanggal rapor dicetak" value="${escHtml(r.tempatTanggal||defaultTempatTanggal())}">
-          </div>
-          <div style="display:flex;gap:8px;justify-content:space-between;margin-top:18px;">
-            <button class="btn btn-outline btn-sm" id="finalize-btn">${iconLock()} ${r.finalized?'Buka Kunci':'Kunci Rapor'}</button>
-            <div style="display:flex;gap:8px;">
-              <button class="btn btn-outline btn-sm" onclick="closeModal()">Batal</button>
-              <button class="btn btn-primary btn-sm" id="save-rapor">Simpan</button>
-            </div>
-          </div>
-        </div>`);
-      function ekskulRowHtml(item){
-        item = item||{};
-        return `<div class="ekskul-row" style="display:flex;gap:8px;align-items:center;">
-          <input class="box-input ek-nama" placeholder="Nama kegiatan (mis. Pramuka)" value="${escHtml(item.nama||'')}" style="flex:2;">
-          <input class="box-input ek-nilai" placeholder="Nilai/Predikat (mis. Baik)" value="${escHtml(item.nilai||'')}" style="flex:1;">
-          <button type="button" class="btn btn-danger btn-sm del-ekskul-row">${iconTrash()}</button>
-        </div>`;
-      }
-      const ekskulWrap = el('ekskul-rows');
-      const existingEkskul = Array.isArray(r.ekstrakurikuler) && r.ekstrakurikuler.length? r.ekstrakurikuler : [{}];
-      ekskulWrap.innerHTML = existingEkskul.map(ekskulRowHtml).join('');
-      ekskulWrap.addEventListener('click', (ev)=>{
-        const btn = ev.target.closest('.del-ekskul-row');
-        if(!btn) return;
-        const rows = ekskulWrap.querySelectorAll('.ekskul-row');
-        if(rows.length>1) btn.closest('.ekskul-row').remove();
-        else btn.closest('.ekskul-row').querySelectorAll('input').forEach(i=>i.value='');
-      });
-      el('add-ekskul').addEventListener('click', ()=>{
-        ekskulWrap.insertAdjacentHTML('beforeend', ekskulRowHtml());
-      });
-      function getEkskulData(){
-        return Array.from(ekskulWrap.querySelectorAll('.ekskul-row')).map(row=>({
-          nama: row.querySelector('.ek-nama').value.trim(),
-          nilai: row.querySelector('.ek-nilai').value.trim()
-        })).filter(x=>x.nama);
-      }
-      const savePayload = ()=>({
-        catatanWaliKelas: el('f-catatan').value.trim(),
-        sikap: { spiritual: el('f-spiritual').value.trim(), sosial: el('f-sosial').value.trim() },
-        kehadiran: { sakit:+el('f-sakit').value||0, izin:+el('f-izin').value||0, alpa:+el('f-alpa').value||0 },
-        ekstrakurikuler: getEkskulData(),
-        keputusan: semester==='2'? (el('f-keputusan')?.value.trim()||'') : (r.keputusan||''),
-        tempatTanggal: el('f-tempattgl').value.trim(),
-      });
-      el('save-rapor').addEventListener('click', async ()=>{
-        const ok = await simpanAman(()=> db.ref(`rapor/${sid}/${kelasId}/${semester}/${sidStudent}`).update(savePayload()), 'Catatan rapor tersimpan.');
-        if(!ok) return;
-        closeModal(); renderWaliKelas(el('main-content'),'rapor');
-      });
-      el('finalize-btn').addEventListener('click', async ()=>{
-        const ok = await simpanAman(
-          ()=> db.ref(`rapor/${sid}/${kelasId}/${semester}/${sidStudent}`).update(Object.assign(savePayload(), {finalized: !r.finalized})),
-          r.finalized? 'Rapor dibuka kembali.' : 'Rapor dikunci.');
-        if(!ok) return;
-        closeModal(); renderWaliKelas(el('main-content'),'rapor');
+      openCatatanRaporModal({
+        sid, kelasId, semester, studentUid: sidStudent,
+        studentNama: siswaMap[sidStudent]?.nama,
+        initialData: raporData[sidStudent]||{},
+        onSaved: ()=> renderWaliKelas(el('main-content'),'rapor'),
       });
     }));
     wrap.querySelectorAll('.print-rapor').forEach(b=>b.addEventListener('click', ()=> printRapor(sid, kelasId, semester, b.dataset.id)));
+    return;
+  }
+
+  if(tab==='riwayat'){
+    target.innerHTML = pageHeader('Riwayat Rapor Siswa', 'Lihat & cetak rapor siswa Kelas '+kelasInfo.nama+' dari kelas 1 SD s.d. kelas 12 SMA.',
+      `<select id="sel-siswa-riwayat" class="box-input" style="min-width:220px;">
+        <option value="">— Pilih siswa —</option>
+        ${siswaList.map(([id,u])=>`<option value="${escHtml(id)}">${escHtml(u.nama)}</option>`).join('')}
+      </select>`);
+    const holder = document.createElement('div'); holder.id = 'riwayat-holder';
+    target.appendChild(holder);
+    if(!siswaList.length){
+      holder.innerHTML = `<div class="card" style="padding:22px;text-align:center;color:var(--text-soft);">Belum ada siswa di kelas ini.</div>`;
+      return;
+    }
+    el('sel-siswa-riwayat').addEventListener('change', (e)=>{
+      const uidStudent = e.target.value;
+      if(!uidStudent){ holder.innerHTML=''; return; }
+      renderRiwayatKelasSiswa(holder, sid, uidStudent, {allowKoreksi:true});
+    });
     return;
   }
 }
 
 /* ===================== SISWA ===================== */
 async function renderSiswa(target, tab){
+  if(tab==='riwayat'){
+    await refreshSekolahData();
+    const sid = state.user.sekolahId;
+    target.innerHTML = pageHeader('Riwayat Rapor', 'Rapor Anda dari kelas 1 SD sampai kelas 12 SMA.');
+    const holder = document.createElement('div'); holder.id = 'riwayat-holder';
+    target.appendChild(holder);
+    await renderRiwayatKelasSiswa(holder, sid, state.user.uid);
+    return;
+  }
   if(tab==='profil'){
     const u = state.user;
     target.innerHTML = pageHeader('Profil Saya', '');
@@ -2543,25 +2693,43 @@ async function renderSiswa(target, tab){
     return;
   }
   if(tab==='rapor'){
+    await refreshSekolahData();
     const sid = state.user.sekolahId, kelasId = state.user.kelasId;
-    const semester = state.sekolahData?.semesterAktif || '1';
+    const semester = getSemesterView();
+    const myToken = ++semRenderToken;
     target.innerHTML = pageHeader('Rapor Saya', 'Tahun Ajaran '+(state.sekolahData?.tahunAjaranAktif||'-')+' — Semester '+semester,
-      `<button id="btn-print-own" class="btn btn-primary btn-sm">${iconPrint()} Cetak Rapor</button>`);
-    const [mSnap, rSnap] = await Promise.all([
-      db.ref('mapel/'+sid).once('value'), db.ref(`rapor/${sid}/${kelasId}/${semester}/${state.user.uid}`).once('value')
-    ]);
-    const mapel = mSnap.val()||{};
-    const raporInfo = rSnap.val()||{};
-    const nilaiRows = [];
-    for(const [mid,m] of sortedMapel(mapel)){
-      const [nS, cS] = await Promise.all([
-        db.ref(`nilai/${sid}/${kelasId}/${mid}/${semester}/${state.user.uid}`).once('value'),
-        db.ref(`capaian/${sid}/${kelasId}/${mid}/${semester}`).once('value')
-      ]);
-      const nv = nS.val()||{};
-      const cp = buildCapaianText(cS.val()||'', nv.nilaiAkhir, state.user);
-      nilaiRows.push({nama:m.nama, ...nv, cp: cp.ok? cp.text : ''});
+      `<div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">${semesterSelectHtml('sel-sem-view')}<button id="btn-print-own" class="btn btn-primary btn-sm">${iconPrint()} Cetak Rapor</button></div>`);
+    bindSemesterSelect('sel-sem-view', ()=> renderSiswa(target, 'rapor'));
+    if(!kelasId){
+      target.insertAdjacentHTML('beforeend', errorCard('Akun Anda belum terdaftar pada kelas manapun. Hubungi Admin Sekolah / Wali Kelas.'));
+      return;
     }
+    el('btn-print-own').addEventListener('click', ()=> printRapor(sid, kelasId, semester, state.user.uid));
+    let mapel = {}, raporInfo = {};
+    const nilaiRows = [];
+    try{
+      const [mSnap, rSnap] = await Promise.all([
+        db.ref('mapel/'+sid).once('value'), db.ref(`rapor/${sid}/${kelasId}/${semester}/${state.user.uid}`).once('value')
+      ]);
+      mapel = mSnap.val()||{};
+      raporInfo = rSnap.val()||{};
+      for(const [mid,m] of sortedMapel(mapel)){
+        const nS = await db.ref(`nilai/${sid}/${kelasId}/${mid}/${semester}/${state.user.uid}`).once('value');
+        // Capaian dibaca terpisah: bila aturan keamanan menolaknya, nilai tetap tampil.
+        let capaianTeks = '';
+        try{ capaianTeks = (await db.ref(`capaian/${sid}/${kelasId}/${mid}/${semester}`).once('value')).val()||''; }
+        catch(e){ console.error(e); }
+        const nv = nS.val()||{};
+        const cp = buildCapaianText(capaianTeks, nv.nilaiAkhir, state.user);
+        nilaiRows.push({nama:m.nama, ...nv, cp: cp.ok? cp.text : ''});
+      }
+    }catch(e){
+      console.error(e);
+      if(myToken!==semRenderToken) return;
+      target.insertAdjacentHTML('beforeend', errorCard(describeDbError(e)));
+      return;
+    }
+    if(myToken!==semRenderToken) return;
     if(nilaiRows.some(n=>n.nilaiAkhir!=null)){
       const chartWrap = document.createElement('div'); chartWrap.style.marginBottom='18px';
       chartWrap.innerHTML = chartCard('Grafik Nilai per Mata Pelajaran', barListChart(
@@ -2604,8 +2772,207 @@ async function renderSiswa(target, tab){
         </div>
       </div>` : ''}`;
     target.appendChild(noteCard);
-    el('btn-print-own').addEventListener('click', ()=> printRapor(sid, kelasId, semester, state.user.uid));
   }
+}
+
+/* ===================== RIWAYAT RAPOR (KELAS 1 s.d. 12) ===================== */
+/* Menampilkan daftar seluruh kelas yang pernah/sedang diikuti seorang siswa (dari riwayatKelas
+   yang dicatat otomatis saat Admin Sekolah mengganti kelas siswa, ditambah kelas yang sedang
+   berjalan), lalu menyediakan tombol cetak rapor per semester untuk tiap kelas tersebut.
+   Bisa dipanggil dari halaman Siswa (untuk dirinya sendiri) maupun Wali Kelas (untuk siswa
+   di kelasnya), karena hanya membutuhkan sid + uid siswa.
+   opts.allowKoreksi=true (dipakai wali kelas) menambahkan kolom aksi untuk mengirim
+   notifikasi koreksi ke wali kelas kelas sebelumnya, atau memperbaiki langsung bila
+   wali kelas yang sedang login masih menjadi wali kelas aktif kelas tersebut. */
+async function renderRiwayatKelasSiswa(target, sid, uid, opts){
+  opts = opts || {};
+  target.innerHTML = loadingCard('Memuat riwayat kelas…');
+  let u = {}, kelasAll = {}, sekolahData = {};
+  try{
+    const [uSnap, kSnap, sSnap] = await Promise.all([
+      db.ref('users/'+uid).once('value'),
+      db.ref('kelas/'+sid).once('value'),
+      db.ref('sekolah/'+sid).once('value'),
+    ]);
+    u = uSnap.val() || {};
+    kelasAll = kSnap.val() || {};
+    sekolahData = sSnap.val() || {};
+  }catch(e){
+    console.error(e);
+    target.innerHTML = errorCard(describeDbError(e));
+    return;
+  }
+  const entries = Object.values(u.riwayatKelas || {}).map(r=>({
+    kelasId: r.kelasId, kelasNama: r.kelasNama || '(kelas tidak diketahui)', tingkat: r.tingkat || '',
+    tahunAjaran: r.tahunAjaran || '-', waliKelasUid: r.waliKelasUid || null, waliKelasNama: r.waliKelasNama || null,
+    current: false,
+  }));
+  if(u.kelasId){
+    entries.push({
+      kelasId: u.kelasId,
+      kelasNama: kelasAll[u.kelasId]?.nama || '(kelas tidak diketahui)',
+      tingkat: kelasAll[u.kelasId]?.tingkat || '',
+      tahunAjaran: sekolahData.tahunAjaranAktif || '-',
+      waliKelasUid: kelasAll[u.kelasId]?.waliKelasUid || null,
+      waliKelasNama: kelasAll[u.kelasId]?.waliKelasNama || null,
+      current: true,
+    });
+  }
+  entries.sort((a,b)=>{
+    const ta = parseFloat(a.tingkat), tb = parseFloat(b.tingkat);
+    if(!isNaN(ta) && !isNaN(tb) && ta!==tb) return ta-tb;
+    if(a.tahunAjaran !== b.tahunAjaran) return String(a.tahunAjaran).localeCompare(String(b.tahunAjaran));
+    return 0;
+  });
+  function aksiKoreksiHtml(en){
+    if(!opts.allowKoreksi || en.current) return '';
+    if(sameId(state.user.kelasId, en.kelasId)){
+      return `<button class="btn btn-outline btn-sm koreksi-sendiri" data-kelas="${escHtml(en.kelasId)}" data-sem="1">${iconEdit()} Perbaiki Smt 1</button>
+              <button class="btn btn-outline btn-sm koreksi-sendiri" data-kelas="${escHtml(en.kelasId)}" data-sem="2">${iconEdit()} Perbaiki Smt 2</button>`;
+    }
+    if(en.waliKelasUid && !sameId(en.waliKelasUid, state.user.uid)){
+      return `<button class="btn btn-outline btn-sm kirim-notif" data-kelas="${escHtml(en.kelasId)}" data-kelasnama="${escHtml(en.kelasNama)}"
+                data-tingkat="${escHtml(en.tingkat)}" data-tahun="${escHtml(en.tahunAjaran)}" data-wali="${escHtml(en.waliKelasUid)}"
+                data-walinama="${escHtml(en.waliKelasNama||'')}">${iconUsers()} Kirim Notifikasi</button>`;
+    }
+    return `<span style="font-size:12px;color:var(--text-soft);font-style:italic;">Wali kelas tidak diketahui — hubungi Admin Sekolah.</span>`;
+  }
+  const wrap = document.createElement('div'); wrap.className='card scroll-x';
+  wrap.innerHTML = `
+    <div style="padding:14px 18px;border-bottom:1px solid var(--border);font-size:13px;font-weight:600;color:var(--text-soft);">
+      ${escHtml(u.nama||'')} ${u.nis? '— NIS '+escHtml(u.nis) : ''}
+    </div>
+    <table class="ledger">
+      <thead><tr><th>Tingkat</th><th>Kelas</th><th>Tahun Ajaran</th><th>Status</th><th></th>${opts.allowKoreksi? '<th>Koreksi</th>':''}</tr></thead>
+      <tbody>
+      ${entries.length? entries.map(en=>`
+        <tr>
+          <td>${escHtml(en.tingkat||'-')}</td>
+          <td style="font-weight:600;">${escHtml(en.kelasNama)}</td>
+          <td>${escHtml(en.tahunAjaran)}</td>
+          <td>${en.current? '<span class="badge" style="background:#DCEBDF;color:#2C5334;">Kelas saat ini</span>' : '<span class="badge" style="background:#F1EEE6;color:var(--text-soft);">Riwayat</span>'}</td>
+          <td style="text-align:right;white-space:nowrap;">
+            <button class="btn btn-outline btn-sm riwayat-print" data-kelas="${escHtml(en.kelasId)}" data-sem="1">${iconPrint()} Smt 1</button>
+            <button class="btn btn-outline btn-sm riwayat-print" data-kelas="${escHtml(en.kelasId)}" data-sem="2">${iconPrint()} Smt 2</button>
+          </td>
+          ${opts.allowKoreksi? `<td style="text-align:right;white-space:nowrap;">${aksiKoreksiHtml(en)}</td>` : ''}
+        </tr>`).join('') : `<tr><td colspan="${opts.allowKoreksi?6:5}" style="text-align:center;padding:22px;color:var(--text-soft);">Belum ada riwayat kelas.</td></tr>`}
+      </tbody>
+    </table>`;
+  target.innerHTML = '';
+  target.appendChild(wrap);
+  wrap.querySelectorAll('.riwayat-print').forEach(b=>b.addEventListener('click', ()=>
+    printRapor(sid, b.dataset.kelas, b.dataset.sem, uid)));
+
+  wrap.querySelectorAll('.koreksi-sendiri').forEach(b=>b.addEventListener('click', async ()=>{
+    const kelasIdTarget = b.dataset.kelas, semTarget = b.dataset.sem;
+    let initialData = {};
+    try{ initialData = (await db.ref(`rapor/${sid}/${kelasIdTarget}/${semTarget}/${uid}`).once('value')).val() || {}; }
+    catch(e){ console.error(e); toast(pesanGagalSimpan(e),'err'); return; }
+    openCatatanRaporModal({
+      sid, kelasId: kelasIdTarget, semester: semTarget, studentUid: uid, studentNama: u.nama,
+      initialData, onSaved: ()=> renderRiwayatKelasSiswa(target, sid, uid, opts),
+    });
+  }));
+
+  wrap.querySelectorAll('.kirim-notif').forEach(b=>b.addEventListener('click', ()=>{
+    const d = b.dataset;
+    openModal(`
+      <div style="padding:26px;">
+        <h3 style="margin:0 0 6px;font-size:17px;">Kirim Notifikasi Perbaikan Rapor</h3>
+        <p style="font-size:13px;color:var(--text-soft);margin:0 0 16px;">
+          Kepada Wali Kelas <strong>${escHtml(d.walinama||'kelas terkait')}</strong> (${escHtml(d.kelasnama)}, Tingkat ${escHtml(d.tingkat)}, TA ${escHtml(d.tahun)})
+          — mengenai rapor <strong>${escHtml(u.nama||'')}</strong>.
+        </p>
+        <div style="display:flex;flex-direction:column;gap:12px;">
+          <select id="f-notif-sem" class="box-input">
+            <option value="1">Semester 1</option>
+            <option value="2">Semester 2</option>
+          </select>
+          <textarea id="f-notif-pesan" class="box-input" rows="4" placeholder="Jelaskan bagian data rapor yang perlu diperbaiki..."></textarea>
+        </div>
+        <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:18px;">
+          <button class="btn btn-outline btn-sm" onclick="closeModal()">Batal</button>
+          <button class="btn btn-primary btn-sm" id="kirim-notif-btn">Kirim</button>
+        </div>
+      </div>`);
+    el('kirim-notif-btn').addEventListener('click', async ()=>{
+      const pesan = el('f-notif-pesan').value.trim();
+      if(!pesan){ toast('Isi pesan terlebih dahulu.','err'); return; }
+      const payload = {
+        dariUid: state.user.uid, dariNama: state.user.nama || '',
+        siswaUid: uid, siswaNama: u.nama || '',
+        kelasId: d.kelas, kelasNama: d.kelasnama, tingkat: d.tingkat, tahunAjaran: d.tahun,
+        semester: el('f-notif-sem').value,
+        pesan, status: 'baru', createdAt: Date.now(),
+      };
+      const ok = await simpanAman(()=> db.ref('notifikasi/'+sid+'/'+d.wali).push(payload), 'Notifikasi terkirim ke wali kelas terkait.');
+      if(!ok) return;
+      closeModal();
+    });
+  }));
+}
+
+/* ===================== NOTIFIKASI KOREKSI RAPOR (antar wali kelas) ===================== */
+async function renderNotifikasiWaliKelas(target){
+  const sid = state.user.sekolahId, uidSaya = state.user.uid;
+  target.innerHTML = loadingCard('Memuat notifikasi…');
+  let list = [];
+  try{
+    const snap = await db.ref('notifikasi/'+sid+'/'+uidSaya).once('value');
+    const val = snap.val() || {};
+    list = Object.entries(val).map(([id,n])=>({id, ...n})).sort((a,b)=>(b.createdAt||0)-(a.createdAt||0));
+  }catch(e){
+    console.error(e);
+    target.innerHTML = errorCard(describeDbError(e));
+    return;
+  }
+  target.innerHTML = pageHeader('Notifikasi Koreksi Rapor', 'Permintaan perbaikan data rapor dari wali kelas lain, untuk siswa yang pernah ada di kelas Anda.');
+  if(!list.length){
+    target.insertAdjacentHTML('beforeend', `<div class="card" style="padding:22px;text-align:center;color:var(--text-soft);">Belum ada notifikasi masuk.</div>`);
+    return;
+  }
+  const wrap = document.createElement('div'); wrap.style.display='flex'; wrap.style.flexDirection='column'; wrap.style.gap='12px';
+  list.forEach(n=>{
+    const card = document.createElement('div'); card.className='card'; card.style.padding='18px 20px';
+    const bisaLangsung = sameId(state.user.kelasId, n.kelasId);
+    card.innerHTML = `
+      <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;">
+        <div>
+          <div style="font-weight:700;font-size:14.5px;">${escHtml(n.siswaNama||'')} — ${escHtml(n.kelasNama||'')} (Tingkat ${escHtml(n.tingkat||'-')}, TA ${escHtml(n.tahunAjaran||'-')}, Semester ${escHtml(n.semester||'-')})</div>
+          <div style="font-size:12.5px;color:var(--text-soft);margin-top:2px;">Dari: ${escHtml(n.dariNama||'-')} · ${n.createdAt? new Date(n.createdAt).toLocaleString('id-ID') : ''}</div>
+        </div>
+        <div>${n.status==='selesai'? '<span class="badge" style="background:#DCEBDF;color:#2C5334;">Selesai</span>' : '<span class="badge" style="background:#FBE9C6;color:#7A5A0E;">Baru</span>'}</div>
+      </div>
+      <p style="font-size:13.5px;margin:12px 0;white-space:pre-wrap;">${escHtml(n.pesan||'')}</p>
+      <div style="display:flex;gap:8px;justify-content:flex-end;flex-wrap:wrap;">
+        ${bisaLangsung? `<button class="btn btn-primary btn-sm buka-perbaiki" data-id="${escHtml(n.id)}">${iconEdit()} Buka & Perbaiki Rapor</button>` :
+          `<span style="font-size:12px;color:var(--text-soft);font-style:italic;align-self:center;">Anda bukan wali kelas aktif untuk kelas ini — hubungi Admin Sekolah bila perlu akses.</span>`}
+        ${n.status!=='selesai'? `<button class="btn btn-outline btn-sm tandai-selesai" data-id="${escHtml(n.id)}">Tandai Selesai</button>` : ''}
+      </div>`;
+    wrap.appendChild(card);
+  });
+  target.appendChild(wrap);
+
+  wrap.querySelectorAll('.tandai-selesai').forEach(b=>b.addEventListener('click', async ()=>{
+    const ok = await simpanAman(()=> db.ref(`notifikasi/${sid}/${uidSaya}/${b.dataset.id}/status`).set('selesai'), 'Notifikasi ditandai selesai.');
+    if(ok) renderNotifikasiWaliKelas(target);
+  }));
+  wrap.querySelectorAll('.buka-perbaiki').forEach(b=>b.addEventListener('click', async ()=>{
+    const n = list.find(x=>x.id===b.dataset.id);
+    if(!n) return;
+    let initialData = {};
+    try{ initialData = (await db.ref(`rapor/${sid}/${n.kelasId}/${n.semester}/${n.siswaUid}`).once('value')).val() || {}; }
+    catch(e){ console.error(e); toast(pesanGagalSimpan(e),'err'); return; }
+    openCatatanRaporModal({
+      sid, kelasId: n.kelasId, semester: n.semester, studentUid: n.siswaUid, studentNama: n.siswaNama,
+      initialData,
+      onSaved: async ()=>{
+        await simpanAman(()=> db.ref(`notifikasi/${sid}/${uidSaya}/${n.id}/status`).set('selesai'));
+        renderNotifikasiWaliKelas(target);
+      },
+    });
+  }));
 }
 
 /* ===================== PRINT RAPOR ===================== */
